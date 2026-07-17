@@ -1,10 +1,4 @@
 # BDA LAB EXPERIMENT 1 REPORT
-**Subject**: Big Data Analytics Lab (Subject Code: D128791(022))  
-**Semester**: VII  
-**Course**: B.Tech Honors Computer Science and Engineering (Data Science)  
-
----
-
 ## 1. Objective
 To use Hadoop to explore large-scale datasets stored in the Hadoop Distributed File System (HDFS), and perform basic operations such as listing files, reading data, and calculating summary statistics.
 
