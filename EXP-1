@@ -1,0 +1,538 @@
+import os
+import sys
+import json
+import shutil
+import math
+import csv
+import random
+from datetime import datetime, timedelta
+
+# Configuration
+HDFS_ROOT = os.path.abspath(".hdfs_data")
+METADATA_FILE = os.path.abspath(".hdfs_metadata.json")
+BLOCK_SIZE_MB = 128
+REPLICATION_FACTOR = 3
+
+# ==========================================
+# 1. Sample Data Generator
+# ==========================================
+def generate_sample_data(filename="sales_data.csv", num_records=10000):
+    categories = {
+        "Electronics": (50.0, 1200.0),
+        "Clothing": (10.0, 150.0),
+        "Home & Kitchen": (15.0, 500.0),
+        "Books": (5.0, 50.0),
+        "Beauty & Health": (8.0, 120.0),
+        "Sports & Outdoors": (12.0, 300.0)
+    }
+    
+    payment_methods = ["Credit Card", "PayPal", "Debit Card", "UPI", "Net Banking"]
+    genders = ["Male", "Female", "Other"]
+    start_date = datetime(2026, 1, 1)
+    
+    print(f"Generating {num_records} transaction records in '{filename}'...")
+    
+    with open(filename, mode="w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            "TransactionID", "Timestamp", "CustomerID", "Age", "Gender", 
+            "Category", "Quantity", "UnitPrice", "TotalAmount", "PaymentMethod"
+        ])
+        
+        for i in range(1, num_records + 1):
+            tx_id = f"TX{i:06d}"
+            delta_seconds = random.randint(0, 200 * 24 * 3600)
+            tx_time = (start_date + timedelta(seconds=delta_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+            cust_id = f"CUST{random.randint(1000, 9999)}"
+            age = random.randint(18, 75)
+            gender = random.choice(genders)
+            
+            category = random.choice(list(categories.keys()))
+            min_price, max_price = categories[category]
+            unit_price = round(random.uniform(min_price, max_price), 2)
+            quantity = random.randint(1, 5)
+            total_amount = round(unit_price * quantity, 2)
+            payment = random.choice(payment_methods)
+            
+            writer.writerow([
+                tx_id, tx_time, cust_id, age, gender, 
+                category, quantity, unit_price, total_amount, payment
+            ])
+            
+    print(f"Successfully generated {num_records} records in '{filename}'.")
+
+# ==========================================
+# 2. HDFS Simulator Class
+# ==========================================
+class HDFSSimulator:
+    def __init__(self):
+        if not os.path.exists(HDFS_ROOT):
+            os.makedirs(HDFS_ROOT)
+        
+        if os.path.exists(METADATA_FILE):
+            try:
+                with open(METADATA_FILE, "r") as f:
+                    self.metadata = json.load(f)
+            except Exception:
+                self.metadata = self._get_initial_metadata()
+        else:
+            self.metadata = self._get_initial_metadata()
+            self._save_metadata()
+
+    def _get_initial_metadata(self):
+        return {
+            "fs_type": "HDFS",
+            "block_size_bytes": BLOCK_SIZE_MB * 1024 * 1024,
+            "replication": REPLICATION_FACTOR,
+            "directories": ["/"],
+            "files": {}
+        }
+
+    def _save_metadata(self):
+        with open(METADATA_FILE, "w") as f:
+            json.dump(self.metadata, f, indent=4)
+
+    def _normalize_path(self, path):
+        if not path.startswith("/"):
+            path = "/" + path
+        if len(path) > 1 and path.endswith("/"):
+            path = path[:-1]
+        return path
+
+    def _get_parent_dir(self, path):
+        if path == "/":
+            return "/"
+        parent = os.path.dirname(path).replace("\\", "/")
+        return parent if parent else "/"
+
+    def _check_dir_exists(self, path):
+        return path in self.metadata["directories"]
+
+    def mkdir(self, path):
+        path = self._normalize_path(path)
+        print(f"\n[Actual Hadoop Command]: hdfs dfs -mkdir -p {path}")
+        print(f"[NameNode] Processing mkdir request for: {path}")
+        
+        if self._check_dir_exists(path):
+            print(f"[NameNode] ERROR: Directory '{path}' already exists.")
+            return False
+
+        parent = self._get_parent_dir(path)
+        if parent != "/" and not self._check_dir_exists(parent):
+            self.mkdir(parent)
+
+        self.metadata["directories"].append(path)
+        self._save_metadata()
+        print(f"[NameNode] Successfully created directory: {path}")
+        return True
+
+    def put(self, local_src, hdfs_dest):
+        print(f"\n[Actual Hadoop Command]: hdfs dfs -put {local_src} {hdfs_dest}")
+        if not os.path.exists(local_src):
+            print(f"Error: Local file '{local_src}' does not exist.")
+            return False
+
+        hdfs_dest = self._normalize_path(hdfs_dest)
+        
+        if self._check_dir_exists(hdfs_dest):
+            filename = os.path.basename(local_src)
+            if hdfs_dest == "/":
+                hdfs_dest = f"/{filename}"
+            else:
+                hdfs_dest = f"{hdfs_dest}/{filename}"
+        else:
+            parent = self._get_parent_dir(hdfs_dest)
+            if not self._check_dir_exists(parent):
+                print(f"[NameNode] ERROR: Parent directory '{parent}' does not exist.")
+                return False
+
+        file_size = os.path.getsize(local_src)
+        block_size_bytes = self.metadata["block_size_bytes"]
+        num_blocks = max(1, math.ceil(file_size / block_size_bytes))
+
+        print(f"[NameNode] Initiating file write for '{hdfs_dest}' ({file_size} bytes)")
+        print(f"[NameNode] Block size configuration: {BLOCK_SIZE_MB} MB ({block_size_bytes} bytes)")
+        print(f"[NameNode] Splitting file into {num_blocks} simulated block(s)...")
+
+        storage_filename = f"hdfs_block_{datetime.now().strftime('%Y%m%d%H%M%S')}_{os.path.basename(local_src)}"
+        storage_path = os.path.join(HDFS_ROOT, storage_filename)
+        shutil.copy2(local_src, storage_path)
+
+        blocks = []
+        for b in range(num_blocks):
+            block_id = f"blk_{100000 + len(self.metadata['files']) * 100 + b}"
+            nodes = [f"datanode-{r}" for r in range(1, REPLICATION_FACTOR + 1)]
+            blocks.append({
+                "block_id": block_id,
+                "block_index": b,
+                "replicas": nodes
+            })
+            print(f"  -> Block {b+1}/{num_blocks} ({block_id}): Allocated replication to {', '.join(nodes)}")
+
+        self.metadata["files"][hdfs_dest] = {
+            "local_src": os.path.abspath(local_src),
+            "storage_file": storage_filename,
+            "size_bytes": file_size,
+            "blocks": blocks,
+            "replication": REPLICATION_FACTOR,
+            "owner": "hadoop",
+            "group": "supergroup",
+            "permissions": "-rw-r--r--",
+            "modification_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        self._save_metadata()
+        print(f"[NameNode] Block allocation and metadata updated.")
+        print(f"[DataNode] Blocks successfully stored and replicated across cluster.")
+        print(f"[NameNode] File upload completed: {hdfs_dest}")
+        return True
+
+    def ls(self, path="/"):
+        path = self._normalize_path(path)
+        print(f"\n[Actual Hadoop Command]: hdfs dfs -ls {path}")
+        
+        is_dir = self._check_dir_exists(path)
+        is_file = path in self.metadata["files"]
+
+        if not is_dir and not is_file:
+            print(f"ls: '{path}': No such file or directory")
+            return False
+
+        print(f"Found {len(self.metadata['files']) + len(self.metadata['directories'])} items")
+        print(f"{'Permissions':<12} {'Repl':<4} {'Owner':<8} {'Group':<10} {'Size (Bytes)':<12} {'Modification Date':<19} {'Path'}")
+        print("-" * 80)
+
+        if is_dir:
+            for d in self.metadata["directories"]:
+                if d == "/":
+                    continue
+                if self._get_parent_dir(d) == path:
+                    print(f"drwxr-xr-x   -    hadoop   supergroup            0 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {d}")
+
+            for f_path, info in self.metadata["files"].items():
+                if self._get_parent_dir(f_path) == path:
+                    print(f"{info['permissions']:<12} {info['replication']:<4} {info['owner']:<8} {info['group']:<10} {info['size_bytes']:<12} {info['modification_time']:<19} {f_path}")
+        elif is_file:
+            info = self.metadata["files"][path]
+            print(f"{info['permissions']:<12} {info['replication']:<4} {info['owner']:<8} {info['group']:<10} {info['size_bytes']:<12} {info['modification_time']:<19} {path}")
+
+        return True
+
+    def cat(self, path, num_lines=15):
+        path = self._normalize_path(path)
+        print(f"\n[Actual Hadoop Command]: hdfs dfs -cat {path}")
+        
+        if path not in self.metadata["files"]:
+            print(f"cat: '{path}': No such file or directory")
+            return False
+
+        info = self.metadata["files"][path]
+        storage_path = os.path.join(HDFS_ROOT, info["storage_file"])
+
+        print(f"[NameNode] Retrieving block list for: {path}")
+        for b in info["blocks"]:
+            print(f"  -> Reading {b['block_id']} from replica {b['replicas'][0]}")
+
+        print(f"\n=== Streaming data from HDFS DataNodes (showing first {num_lines} lines) ===")
+        try:
+            with open(storage_path, "r", encoding="utf-8") as f:
+                for i in range(num_lines):
+                    line = f.readline()
+                    if not line:
+                        break
+                    print(line.strip())
+            print("=========================================================================")
+        except Exception as e:
+            print(f"Error reading data: {e}")
+            return False
+        return True
+
+    def rm(self, path):
+        path = self._normalize_path(path)
+        print(f"\n[Actual Hadoop Command]: hdfs dfs -rm -r {path}")
+
+        if path in self.metadata["files"]:
+            info = self.metadata["files"][path]
+            storage_path = os.path.join(HDFS_ROOT, info["storage_file"])
+            if os.path.exists(storage_path):
+                os.remove(storage_path)
+            
+            del self.metadata["files"][path]
+            self._save_metadata()
+            print(f"[NameNode] Deleted file metadata. DataNode blocks removed.")
+            print(f"Deleted {path}")
+            return True
+            
+        elif path in self.metadata["directories"]:
+            if path == "/":
+                print("Error: Cannot delete HDFS root directory.")
+                return False
+                
+            files_to_del = [f for f in self.metadata["files"] if f.startswith(path + "/")]
+            dirs_to_del = [d for d in self.metadata["directories"] if d.startswith(path + "/")]
+
+            for f in files_to_del:
+                info = self.metadata["files"][f]
+                storage_path = os.path.join(HDFS_ROOT, info["storage_file"])
+                if os.path.exists(storage_path):
+                    os.remove(storage_path)
+                del self.metadata["files"][f]
+                print(f"Deleted file {f}")
+
+            for d in dirs_to_del:
+                self.metadata["directories"].remove(d)
+                print(f"Deleted directory {d}")
+
+            self.metadata["directories"].remove(path)
+            self._save_metadata()
+            print(f"Deleted directory {path}")
+            return True
+        else:
+            print(f"rm: '{path}': No such file or directory")
+            return False
+
+    def stats(self, path):
+        path = self._normalize_path(path)
+        print(f"\n[Actual Hadoop Command / Data Exploration Job]: MapReduce/Spark job running summary statistics on {path}")
+        
+        if path not in self.metadata["files"]:
+            print(f"stats: '{path}': No such file in HDFS.")
+            return False
+
+        info = self.metadata["files"][path]
+        storage_path = os.path.join(HDFS_ROOT, info["storage_file"])
+
+        print(f"[MapReduce Engine] Initiating MapReduce-style aggregation...")
+        print(f"[MapReduce Engine] Map Phase: Emitting column values from HDFS blocks...")
+        
+        try:
+            with open(storage_path, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader)
+                
+                data_columns = {col: [] for col in header}
+                row_count = 0
+                
+                for row in reader:
+                    if not row:
+                        continue
+                    row_count += 1
+                    for col_idx, val in enumerate(row):
+                        col_name = header[col_idx]
+                        try:
+                            if "." in val:
+                                data_columns[col_name].append(float(val))
+                            else:
+                                data_columns[col_name].append(int(val))
+                        except ValueError:
+                            data_columns[col_name].append(val)
+            
+            print(f"[MapReduce Engine] Reduce Phase: Combining intermediate stats from DataNodes...")
+            print(f"\n=== DATA EXPLORATION REPORT: {path} ===")
+            print(f"Total Records Count: {row_count}")
+            print(f"Total Attributes (Columns) Count: {len(header)}")
+            print("-" * 50)
+            
+            print("Attribute Data Types:")
+            for col in header:
+                sample_vals = [v for v in data_columns[col] if v is not None]
+                if sample_vals:
+                    first_val = sample_vals[0]
+                    if isinstance(first_val, (int, float)):
+                        t_name = "NUMERIC"
+                    else:
+                        t_name = "CATEGORICAL/TEXT"
+                else:
+                    t_name = "UNKNOWN"
+                print(f"  - {col}: {t_name}")
+            print("-" * 50)
+
+            numeric_cols = [col for col in header if isinstance(data_columns[col][0], (int, float))]
+            print(f"{'Numeric Metric':<18} | " + " | ".join(f"{col:<12}" for col in numeric_cols))
+            print("-" * 90)
+            
+            def get_quantile(sorted_list, q):
+                if not sorted_list:
+                    return 0
+                idx = (len(sorted_list) - 1) * q
+                floor_idx = int(math.floor(idx))
+                ceil_idx = int(math.ceil(idx))
+                if floor_idx == ceil_idx:
+                    return sorted_list[floor_idx]
+                return sorted_list[floor_idx] * (ceil_idx - idx) + sorted_list[ceil_idx] * (idx - floor_idx)
+
+            stats_data = {}
+            for col in numeric_cols:
+                vals = sorted(data_columns[col])
+                count = len(vals)
+                col_sum = sum(vals)
+                mean = col_sum / count if count > 0 else 0
+                
+                variance = sum((x - mean) ** 2 for x in vals) / (count - 1) if count > 1 else 0
+                std_dev = math.sqrt(variance)
+                
+                stats_data[col] = {
+                    "count": count,
+                    "mean": round(mean, 4),
+                    "std": round(std_dev, 4),
+                    "min": round(vals[0], 4) if count > 0 else 0,
+                    "25%": round(get_quantile(vals, 0.25), 4) if count > 0 else 0,
+                    "50%": round(get_quantile(vals, 0.50), 4) if count > 0 else 0,
+                    "75%": round(get_quantile(vals, 0.75), 4) if count > 0 else 0,
+                    "max": round(vals[-1], 4) if count > 0 else 0
+                }
+
+            metrics = ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]
+            for m in metrics:
+                row_str = f"{m.capitalize():<18} | "
+                row_str += " | ".join(f"{stats_data[col][m]:<12}" for col in numeric_cols)
+                print(row_str)
+            print("-" * 90)
+
+            print("\nCategorical Distributions (Top Unique Values):")
+            categorical_cols = [col for col in header if not isinstance(data_columns[col][0], (int, float))]
+            for col in categorical_cols:
+                counts = {}
+                for item in data_columns[col]:
+                    counts[item] = counts.get(item, 0) + 1
+                sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+                
+                print(f"  Attribute: {col} (Unique values: {len(counts)})")
+                for val, cnt in sorted_counts[:3]:
+                    pct = (cnt / row_count) * 100
+                    print(f"    - {val}: {cnt} ({pct:.2f}%)")
+            print("=========================================\n")
+
+        except Exception as e:
+            print(f"Error calculating stats: {e}")
+            return False
+        return True
+
+# ==========================================
+# 3. Master Walkthrough / Experiment Runner
+# ==========================================
+def cleanup_workspace():
+    print("=== Cleaning Up Old Simulated HDFS Environment ===")
+    metadata_file = ".hdfs_metadata.json"
+    data_dir = ".hdfs_data"
+    temp_sales_data = "sales_data.csv"
+    
+    if os.path.exists(metadata_file):
+        os.remove(metadata_file)
+        print(f"Removed metadata file: {metadata_file}")
+    if os.path.exists(data_dir):
+        shutil.rmtree(data_dir)
+        print(f"Removed data directory: {data_dir}")
+    if os.path.exists(temp_sales_data):
+        os.remove(temp_sales_data)
+        print(f"Removed local temp file: {temp_sales_data}")
+    print("Cleanup complete.\n")
+
+def run_walkthrough_experiment():
+    print("=" * 80)
+    print("BIG DATA ANALYTICS LAB - EXPERIMENT 1")
+    print("EXPERIMENT NAME: Data Exploration with Hadoop (Consolidated Suite)")
+    print("=" * 80)
+    
+    # 1. Clean up old states
+    cleanup_workspace()
+    
+    # 2. Generate local sample data
+    print("\n--- STEP 1: Generating Local Sample Dataset ---")
+    generate_sample_data("sales_data.csv", 10000)
+    
+    # Initialize HDFS
+    sim = HDFSSimulator()
+    
+    # 3. Create HDFS directories
+    print("\n--- STEP 2: Creating HDFS Directories ---")
+    sim.mkdir("/user")
+    sim.mkdir("/user/hadoop")
+    sim.mkdir("/user/hadoop/sales")
+    
+    # 4. Upload local file to HDFS
+    print("\n--- STEP 3: Uploading Local File to HDFS ---")
+    sim.put("sales_data.csv", "/user/hadoop/sales")
+    
+    # 5. List HDFS directories
+    print("\n--- STEP 4: Listing Files in HDFS ---")
+    sim.ls("/")
+    sim.ls("/user/hadoop/sales")
+    
+    # 6. Read file from HDFS
+    print("\n--- STEP 5: Viewing Head of HDFS File ---")
+    sim.cat("/user/hadoop/sales/sales_data.csv", num_lines=10)
+    
+    # 7. Perform Data Exploration & Calculate Summary Statistics
+    print("\n--- STEP 6: Running MapReduce Data Exploration & Statistics ---")
+    sim.stats("/user/hadoop/sales/sales_data.csv")
+    
+    print("\n" + "=" * 80)
+    print("EXPERIMENT 1 WALKTHROUGH COMPLETED SUCCESSFULLY")
+    print("=" * 80)
+
+# ==========================================
+# 4. Main CLI Entry Point
+# ==========================================
+def print_help():
+    print("""
+Consolidated Hadoop HDFS Simulator CLI
+Usage:
+  python hadoop_exploration.py                       (Runs full lab experiment walkthrough)
+  python hadoop_exploration.py mkdir <hdfs_path>
+  python hadoop_exploration.py put <local_file> <hdfs_path>
+  python hadoop_exploration.py ls [hdfs_path]
+  python hadoop_exploration.py cat <hdfs_file_path>
+  python hadoop_exploration.py rm <hdfs_path>
+  python hadoop_exploration.py stats <hdfs_file_path>
+  python hadoop_exploration.py generate [filename] [num_records]
+    """)
+
+def main():
+    if len(sys.argv) < 2:
+        # Run walkthrough automatically if no parameters are supplied
+        run_walkthrough_experiment()
+        sys.exit(0)
+
+    cmd = sys.argv[1].lower()
+    sim = HDFSSimulator()
+
+    if cmd == "mkdir":
+        if len(sys.argv) < 3:
+            print("Usage: python hadoop_exploration.py mkdir <hdfs_path>")
+            sys.exit(1)
+        sim.mkdir(sys.argv[2])
+    elif cmd == "put":
+        if len(sys.argv) < 4:
+            print("Usage: python hadoop_exploration.py put <local_file> <hdfs_path>")
+            sys.exit(1)
+        sim.put(sys.argv[2], sys.argv[3])
+    elif cmd == "ls":
+        path = sys.argv[2] if len(sys.argv) > 2 else "/"
+        sim.ls(path)
+    elif cmd == "cat":
+        if len(sys.argv) < 3:
+            print("Usage: python hadoop_exploration.py cat <hdfs_file_path>")
+            sys.exit(1)
+        sim.cat(sys.argv[2])
+    elif cmd == "rm":
+        if len(sys.argv) < 3:
+            print("Usage: python hadoop_exploration.py rm <hdfs_path>")
+            sys.exit(1)
+        sim.rm(sys.argv[2])
+    elif cmd == "stats":
+        if len(sys.argv) < 3:
+            print("Usage: python hadoop_exploration.py stats <hdfs_file_path>")
+            sys.exit(1)
+        sim.stats(sys.argv[2])
+    elif cmd == "generate":
+        filename = sys.argv[2] if len(sys.argv) > 2 else "sales_data.csv"
+        records = int(sys.argv[3]) if len(sys.argv) > 3 else 10000
+        generate_sample_data(filename, records)
+    else:
+        print(f"Unknown command: {cmd}")
+        print_help()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
